@@ -5,6 +5,11 @@ use std::marker::PhantomData;
 use std::borrow::BorrowMut;
 
 pub trait BitChunkAccessor: Debug + Display + Copy {
+    type PrimitiveType: std::ops::BitAnd<Self::PrimitiveType, Output=Self::PrimitiveType>
+        + std::ops::BitOr<Self::PrimitiveType, Output=Self::PrimitiveType>
+        + std::ops::Shr<usize, Output=Self::PrimitiveType>
+        + std::ops::Shl<usize, Output=Self::PrimitiveType>
+        + std::ops::Sub<Self::PrimitiveType, Output=Self::PrimitiveType>;
 
     fn bytes() -> usize {
         return std::mem::size_of::<Self>()
@@ -14,31 +19,69 @@ pub trait BitChunkAccessor: Debug + Display + Copy {
         Self::bytes() * 8
     }
 
-    unsafe fn read(ptr: *const u8, offset: isize) -> u64;
+    fn one() -> Self::PrimitiveType;
+
+    unsafe fn read(ptr: *const u8, offset: isize) -> Self::PrimitiveType;
 }
 
 impl BitChunkAccessor for u8 {
-    unsafe fn read(ptr: *const u8, offset: isize) -> u64 {
+    type PrimitiveType = u8;
+
+    fn one() -> u8 {
+        1_u8
+    }
+
+    unsafe fn read(ptr: *const u8, offset: isize) -> u8 {
         // no need for unaligned read for bytes
-        std::ptr::read(ptr.offset(offset)) as u64
+        std::ptr::read(ptr.offset(offset))
     }
 }
 
 impl BitChunkAccessor for u16 {
-    unsafe fn read(ptr: *const u8, offset: isize) -> u64 {
-        std::ptr::read_unaligned((ptr as *const u16).offset(offset)) as u64
+    type PrimitiveType = u16;
+
+    fn one() -> u16 {
+        1_u16
+    }
+
+    unsafe fn read(ptr: *const u8, offset: isize) -> u16 {
+        std::ptr::read_unaligned((ptr as *const u16).offset(offset))
     }
 }
 
 impl BitChunkAccessor for u32 {
-    unsafe fn read(ptr: *const u8, offset: isize) -> u64 {
-        std::ptr::read_unaligned((ptr as *const u32).offset(offset)) as u64
+    type PrimitiveType = u32;
+
+    fn one() -> u32 {
+        1_u32
+    }
+
+    unsafe fn read(ptr: *const u8, offset: isize) -> u32 {
+        std::ptr::read_unaligned((ptr as *const u32).offset(offset))
     }
 }
 
 impl BitChunkAccessor for u64 {
+    type PrimitiveType = u64;
+
+    fn one() -> u64 {
+        1_u64
+    }
+
     unsafe fn read(ptr: *const u8, offset: isize) -> u64 {
         std::ptr::read_unaligned((ptr as *const u64).offset(offset))
+    }
+}
+
+impl BitChunkAccessor for u128 {
+    type PrimitiveType = u128;
+
+    fn one() -> u128 {
+        1_u128
+    }
+
+    unsafe fn read(ptr: *const u8, offset: isize) -> u128 {
+        std::ptr::read_unaligned((ptr as *const u128).offset(offset))
     }
 }
 
@@ -149,7 +192,7 @@ impl <'a, T: BitChunkAccessor> BitChunks<'a, T> {
 }
 
 impl <'a, T: BitChunkAccessor> IntoIterator for BitChunks<'a, T> {
-    type Item = u64;
+    type Item = T::PrimitiveType;
     type IntoIter = BitChunkIterator<'a, T>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -158,7 +201,7 @@ impl <'a, T: BitChunkAccessor> IntoIterator for BitChunks<'a, T> {
 }
 
 impl <T: BitChunkAccessor> Iterator for BitChunkIterator<'_, T> {
-    type Item = u64;
+    type Item = T::PrimitiveType;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index >= self.chunk_len {
@@ -171,7 +214,7 @@ impl <T: BitChunkAccessor> Iterator for BitChunkIterator<'_, T> {
             current
         } else {
             let next = unsafe { T::read(self.raw_data, self.index as isize + 1) };
-            current >> self.bit_offset | (next & ((1 << self.bit_offset) - 1)) << (T::bits() - self.bit_offset)
+            current >> self.bit_offset | (next & ((T::one() << self.bit_offset) - T::one())) << (T::bits() - self.bit_offset)
         };
 
         self.index += 1;
@@ -221,18 +264,18 @@ pub fn aggregate_sum_kernel(input: &[f32], valid: &[u8], offset: usize) -> f32 {
 }
 
 pub fn combine_bitmap(left: &[u8], left_offset: usize, right: &[u8], right_offset: usize, output: &mut [u8]) {
-    let chunk_size = <u64 as BitChunkAccessor>::bytes();
-    let left_chunks = bit_chunk_iterator::<u64>(left, left_offset);
-    let right_chunks = bit_chunk_iterator::<u64>(right, right_offset);
+    let chunk_size = <u128 as BitChunkAccessor>::bytes();
+    let left_chunks = bit_chunk_iterator::<u128>(left, left_offset);
+    let right_chunks = bit_chunk_iterator::<u128>(right, right_offset);
     let mut output_chunks = output.chunks_exact_mut(chunk_size);
     output_chunks
         .borrow_mut()
         .zip(left_chunks.iter().zip(right_chunks.iter()))
         .for_each(|(out, (l, r))| {
-        let out: &mut [u64] = unsafe {std::mem::transmute(out) };
-        out[0] = l&r;
+        //let out: &mut [u128] = unsafe {std::mem::transmute(out) };
+        //out[0] = l&r;
 
-        //unsafe { (out.as_mut_ptr() as *mut u64).write(l&r) };
+        unsafe { (out.as_mut_ptr() as *mut u128).write(l&r) };
     });
     output_chunks.into_remainder()
         .iter_mut()
@@ -261,7 +304,7 @@ mod tests {
         let input: &[u8] = &[0,1,2,4];
 
         let bitchunks = bit_chunk_iterator::<u8>(input, 0);
-        let result = bitchunks.into_iter().collect::<Vec<u64>>();
+        let result = bitchunks.into_iter().collect::<Vec<u8>>();
 
         assert_eq!(vec![0,1,2,4], result);
     }
@@ -275,7 +318,7 @@ mod tests {
         assert_eq!(7, bitchunks.remainder_len());
         assert_eq!(0b00100010, bitchunks.remainder_bits());
 
-        let result = bitchunks.into_iter().collect::<Vec<u64>>();
+        let result = bitchunks.into_iter().collect::<Vec<u8>>();
 
         assert_eq!(vec![0b10000000, 0b00001000, 0b00010001], result);
     }
@@ -286,7 +329,7 @@ mod tests {
 
         let bitchunks = bit_chunk_iterator::<u16>(input, 1);
 
-        let result = bitchunks.iter().collect::<Vec<u64>>();
+        let result = bitchunks.iter().collect::<Vec<u16>>();
 
         assert_eq!(vec![0b1111111110101010], result);
 
@@ -298,7 +341,7 @@ mod tests {
     fn test_iter_aligned_16() {
         let input: &[u8] = &[0,1,2,4];
 
-        let result = bit_chunk_iterator::<u16>(input, 0).into_iter().collect::<Vec<u64>>();
+        let result = bit_chunk_iterator::<u16>(input, 0).into_iter().collect::<Vec<u16>>();
 
         assert_eq!(vec![0x0100,0x0402], result);
     }
