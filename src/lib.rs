@@ -2,6 +2,7 @@
 #![allow(unused_parens)]
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
+use std::borrow::BorrowMut;
 
 pub trait BitChunkAccessor: Debug + Display + Copy {
 
@@ -78,9 +79,6 @@ pub fn bit_chunk_iterator<T: BitChunkAccessor>(buffer: &[u8], bit_offset: usize)
     let len_bits = (buffer.len()-byte_offset)*8 - bit_offset ;
     let chunk_len = (len_bits) / bits;
 
-    dbg!(buffer.len());
-    dbg!(len_bits);
-
     let remainder_len = (len_bits & (bits-1));
 
     BitChunks::<T> {
@@ -99,20 +97,42 @@ impl <'a, T: BitChunkAccessor> BitChunks<'a, T> {
     }
 
     pub fn remainder_bits(&self) -> u64 {
-        if self.remainder_len == 0 {
+        let bit_len = self.remainder_len;
+        if bit_len == 0 {
             0
         } else {
+            let byte_len = ceil_div_power_of_2(bit_len as u64, 8) as usize;
+
             let mut res = 0_u64;
-            for i in 0..ceil_div_power_of_2(self.remainder_len as u64, 8) as usize {
+            for i in 0..byte_len {
                 res |= (self.buffer[self.chunk_len * T::bytes() + i] as u64) << (i*8);
             }
 
             let offset = self.bit_offset as u64;
-            if (offset != 0) {
+            if offset != 0 {
                 (res >> offset) & !(1 << (64 - offset) - 1)
             } else {
                 res
             }
+        }
+    }
+
+    pub fn remainder_bytes(&self) -> Vec<u8> {
+        let bit_len = self.remainder_len;
+        if bit_len == 0 {
+            vec![]
+        } else {
+            let bits = self.remainder_bits();
+
+            let byte_len = ceil_div_power_of_2(bit_len as u64, 8) as usize;
+
+            let mut res: Vec<u8> = Vec::with_capacity(byte_len);
+
+            for i in 0..byte_len {
+                res.push((bits >> (i*8) & 0xFF) as u8);
+            }
+
+            res
         }
     }
 
@@ -200,47 +220,32 @@ pub fn aggregate_sum_kernel(input: &[f32], valid: &[u8], offset: usize) -> f32 {
     sum
 }
 
-
-pub fn mul_kernel(left: &[f32], right: &[f32], valid: &[u8], offset: usize, output: &mut[f32]) {
-    let mask_size = <u64 as BitChunkAccessor>::bits();
-    let output_chunks = output.chunks_exact_mut(mask_size);
-    let left_chunks = left[offset..].chunks_exact(mask_size);
-    let right_chunks = right[offset..].chunks_exact(mask_size);
-
-    bit_chunk_iterator::<u64>(valid, offset)
-        .into_iter()
-        .zip(output_chunks.into_iter()
-                 .zip(left_chunks.into_iter().zip(right_chunks.into_iter())))
-        .for_each(|(mask, (out, (l, r)))| {
-            for i in 0..mask_size {
-                let blend = if (mask & (1<<i)) != 0 {
-                    1.0
-                } else {
-                    0.0
-                };
-                out[i] = blend * (l[i] * r[i]);
-            }
-        });
-}
-
-pub fn combine_bitmap(left: &[u8], left_offset: usize, right: &[u8], right_offset: usize, output: &mut[u8]) {
+pub fn combine_bitmap(left: &[u8], left_offset: usize, right: &[u8], right_offset: usize, output: &mut [u8]) {
     let chunk_size = <u64 as BitChunkAccessor>::bytes();
     let left_chunks = bit_chunk_iterator::<u64>(left, left_offset);
     let right_chunks = bit_chunk_iterator::<u64>(right, right_offset);
-    output.chunks_exact_mut(chunk_size)
-        .zip(left_chunks.into_iter().zip(right_chunks.into_iter()))
+    let mut output_chunks = output.chunks_exact_mut(chunk_size);
+    output_chunks
+        .borrow_mut()
+        .zip(left_chunks.iter().zip(right_chunks.iter()))
         .for_each(|(out, (l, r))| {
         let out: &mut [u64] = unsafe {std::mem::transmute(out) };
         out[0] = l&r;
 
         //unsafe { (out.as_mut_ptr() as *mut u64).write(l&r) };
-    })
+    });
+    output_chunks.into_remainder()
+        .iter_mut()
+        .zip(left_chunks.remainder_bytes().iter().zip(right_chunks.remainder_bytes().iter()))
+        .for_each(|(out, (l, r))| {
+           *out = l&r;
+        });
 
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{bit_chunk_iterator, ceil_div_power_of_2, mul_kernel, aggregate_sum_kernel};
+    use crate::{bit_chunk_iterator, ceil_div_power_of_2, aggregate_sum_kernel};
 
     #[test]
     fn test_ceil() {
@@ -299,22 +304,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mul_kernel() {
-        let left: Vec<f32> = (0..1024).map(|i| if i % 2 == 0  {2.0} else {1.0}).collect();
-        let right: Vec<f32> = (0..1024).map(|i| if i % 2 == 0  {2.0} else {1.0}).collect();
-        let mut out = Vec::<f32>::with_capacity(1024);
-        unsafe {out.set_len(1024)};
-        let valid : Vec<u8> = (0..1024/8).map(|i| 0b01010101).collect();
-
-        let expected: Vec<f32> = (0..1024).map(|i| if i % 2 == 0  {4.0} else {0.0}).collect();
-
-        mul_kernel(&left, &right, &valid, 0, &mut out);
-
-        assert_eq!(expected, out);
-
-    }
-
-    #[test]
     fn test_aggregate_sum_kernel() {
         let len = 1000;
         let input: Vec<f32> = (0..len).map(|i| if i % 2 == 0  {2.0} else {1.0}).collect();
@@ -325,6 +314,12 @@ mod tests {
         let result = aggregate_sum_kernel(&input, &valid, 0);
 
         assert_eq!(expected, result);
+    }
+
+    #[test]
+    fn test_combine_bitmap() {
+        let left: Vec<f32> = (0..1024).map(|i| if i % 2 == 0  {2.0} else {1.0}).collect();
+        let right: Vec<f32> = (0..1024).map(|i| if i % 2 == 0  {2.0} else {1.0}).collect();
     }
 
 }
