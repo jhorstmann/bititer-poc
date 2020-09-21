@@ -41,7 +41,20 @@ impl BitChunkAccessor for u64 {
     }
 }
 
+#[inline(always)]
+fn ceil_div_power_of_2(n: u64, p: u64) -> u64 {
+    debug_assert!(p.is_power_of_two());
+    ((n + 7) & !(p-1)) / p
+}
 
+pub struct BitChunks<'a, T: BitChunkAccessor> {
+    buffer: &'a [u8],
+    accessor: PhantomData<T>,
+    bit_offset: usize,
+    raw_data: *const u8,
+    chunk_len: usize,
+    remainder_len: usize,
+}
 
 pub struct BitChunkIterator<'a, T: BitChunkAccessor> {
     buffer: &'a [u8],
@@ -49,23 +62,10 @@ pub struct BitChunkIterator<'a, T: BitChunkAccessor> {
     bit_offset: usize,
     raw_data: *const u8,
     chunk_len: usize,
-    remainder_len: usize,
     index: usize,
 }
 
-#[inline(always)]
-fn ceil_power_of_2(n: u64, p: u64) -> u64 {
-    debug_assert!(p.is_power_of_two());
-    (n + 7) & !(p-1)
-}
-
-#[inline(always)]
-fn floor_power_of_2(n: usize, p: usize) -> usize {
-    debug_assert!(p.is_power_of_two());
-    (n) & !(p-1)
-}
-
-pub fn bit_chunk_iterator<T: BitChunkAccessor>(buffer: &[u8], bit_offset: usize) -> BitChunkIterator<'_, T> {
+pub fn bit_chunk_iterator<T: BitChunkAccessor>(buffer: &[u8], bit_offset: usize) -> BitChunks<'_, T> {
     let bytes = T::bytes();
     let bits = T::bits();
     debug_assert!(bits.is_power_of_two() && bits >= 8 && bits <= 64);
@@ -83,28 +83,27 @@ pub fn bit_chunk_iterator<T: BitChunkAccessor>(buffer: &[u8], bit_offset: usize)
 
     let remainder_len = (len_bits & (bits-1));
 
-    BitChunkIterator::<T> {
+    BitChunks::<T> {
         buffer,
         accessor: PhantomData::<T>::default(),
         bit_offset,
         raw_data,
         chunk_len,
         remainder_len,
-        index: 0,
     }
 }
 
-impl <T: BitChunkAccessor> BitChunkIterator<'_, T> {
-    fn remainder_len(&self) -> usize {
+impl <'a, T: BitChunkAccessor> BitChunks<'a, T> {
+    pub fn remainder_len(&self) -> usize {
         self.remainder_len
     }
 
-    fn remainder_bits(&self) -> u64 {
+    pub fn remainder_bits(&self) -> u64 {
         if self.remainder_len == 0 {
             0
         } else {
             let mut res = 0_u64;
-            for i in 0..ceil_power_of_2(self.remainder_len as u64, 8) as usize / 8 {
+            for i in 0..ceil_div_power_of_2(self.remainder_len as u64, 8) as usize {
                 res |= (self.buffer[self.chunk_len * T::bytes() + i] as u64) << (i*8);
             }
 
@@ -115,6 +114,26 @@ impl <T: BitChunkAccessor> BitChunkIterator<'_, T> {
                 res
             }
         }
+    }
+
+    pub fn iter(&self) -> BitChunkIterator<'a, T> {
+        BitChunkIterator::<'a, T> {
+            buffer: self.buffer,
+            accessor: PhantomData::default(),
+            bit_offset: self.bit_offset,
+            raw_data: self.raw_data,
+            chunk_len: self.chunk_len,
+            index: 0
+        }
+    }
+}
+
+impl <'a, T: BitChunkAccessor> IntoIterator for BitChunks<'a, T> {
+    type Item = u64;
+    type IntoIter = BitChunkIterator<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -151,12 +170,10 @@ pub fn aggregate_sum_kernel(input: &[f32], valid: &[u8], offset: usize) -> f32 {
 
     let sum = &mut [0_f32; 64];
 
-    let bititer = bit_chunk_iterator::<u64>(valid, offset);
+    let bitchunks = bit_chunk_iterator::<u64>(valid, offset);
 
-    let remainder_len = bititer.remainder_len();
-    let remainder_bits = bititer.remainder_bits();
-
-    bititer
+    bitchunks
+        .iter()
         .zip(chunks.into_iter())
         .for_each(|(mask, slice)| {
             for i in 0..64 {
@@ -170,6 +187,9 @@ pub fn aggregate_sum_kernel(input: &[f32], valid: &[u8], offset: usize) -> f32 {
         });
 
     let mut sum: f32 = sum.iter().sum();
+
+    let remainder_len = bitchunks.remainder_len();
+    let remainder_bits = bitchunks.remainder_bits();
 
     for i in 0..remainder_len {
         if remainder_bits & (1<<i) != 0 {
@@ -188,6 +208,7 @@ pub fn mul_kernel(left: &[f32], right: &[f32], valid: &[u8], offset: usize, outp
     let right_chunks = right[offset..].chunks_exact(mask_size);
 
     bit_chunk_iterator::<u64>(valid, offset)
+        .into_iter()
         .zip(output_chunks.into_iter()
                  .zip(left_chunks.into_iter().zip(right_chunks.into_iter())))
         .for_each(|(mask, (out, (l, r)))| {
@@ -202,41 +223,13 @@ pub fn mul_kernel(left: &[f32], right: &[f32], valid: &[u8], offset: usize, outp
         });
 }
 
-
-pub fn cmp_kernel(left: &[f32], right: &[f32], valid: &[u8], offset: usize, output: &mut[u8]) {
-    let chunk_size = <u64 as BitChunkAccessor>::bits();
-    let output_chunks = output.chunks_exact_mut(chunk_size);
-    let left_chunks = left[offset..].chunks_exact(chunk_size);
-    let right_chunks = right[offset..].chunks_exact(chunk_size);
-
-    bit_chunk_iterator::<u64>(valid, offset)
-        .zip(output_chunks.into_iter()
-            .zip(left_chunks.into_iter().zip(right_chunks.into_iter())))
-        .for_each(|(mask, (out, (l, r)))| {
-            let out: &mut [u64] = unsafe {std::mem::transmute(out) };
-            let mut res_mask = 0_u64;
-            for i in 0..chunk_size {
-                let bit = if (mask & (1<<i)) != 0 {
-                    1
-                } else {
-                    0
-                };
-                res_mask |= if (l[i] == r[i]) {
-                    1 << i
-                } else {
-                    0
-                };
-            }
-            out[0] = res_mask;
-        });
-}
-
 pub fn combine_bitmap(left: &[u8], left_offset: usize, right: &[u8], right_offset: usize, output: &mut[u8]) {
     let chunk_size = <u64 as BitChunkAccessor>::bytes();
-    output.chunks_exact_mut(chunk_size).zip(
-        bit_chunk_iterator::<u64>(left, left_offset)
-            .zip(bit_chunk_iterator::<u64>(right, right_offset))
-    ).for_each(|(out, (l, r))| {
+    let left_chunks = bit_chunk_iterator::<u64>(left, left_offset);
+    let right_chunks = bit_chunk_iterator::<u64>(right, right_offset);
+    output.chunks_exact_mut(chunk_size)
+        .zip(left_chunks.into_iter().zip(right_chunks.into_iter()))
+        .for_each(|(out, (l, r))| {
         let out: &mut [u64] = unsafe {std::mem::transmute(out) };
         out[0] = l&r;
 
@@ -247,31 +240,23 @@ pub fn combine_bitmap(left: &[u8], left_offset: usize, right: &[u8], right_offse
 
 #[cfg(test)]
 mod tests {
-    use crate::{bit_chunk_iterator, ceil_power_of_2, floor_power_of_2, mul_kernel, aggregate_sum_kernel};
+    use crate::{bit_chunk_iterator, ceil_div_power_of_2, mul_kernel, aggregate_sum_kernel};
 
     #[test]
     fn test_ceil() {
-        assert_eq!(0, ceil_power_of_2(0, 8));
-        assert_eq!(8, ceil_power_of_2(1, 8));
-        assert_eq!(8, ceil_power_of_2(7, 8));
-        assert_eq!(8, ceil_power_of_2(8, 8));
-        assert_eq!(16, ceil_power_of_2(9, 8));
-    }
-
-    #[test]
-    fn test_floor_bits() {
-        assert_eq!(0, floor_power_of_2(0, 8));
-        assert_eq!(0, floor_power_of_2(1, 8));
-        assert_eq!(0, floor_power_of_2(7, 8));
-        assert_eq!(8, floor_power_of_2(8, 8));
-        assert_eq!(8, floor_power_of_2(9, 8));
+        assert_eq!(0, ceil_div_power_of_2(0, 8));
+        assert_eq!(1, ceil_div_power_of_2(1, 8));
+        assert_eq!(1, ceil_div_power_of_2(7, 8));
+        assert_eq!(1, ceil_div_power_of_2(8, 8));
+        assert_eq!(2, ceil_div_power_of_2(9, 8));
     }
 
     #[test]
     fn test_iter_aligned_8() {
         let input: &[u8] = &[0,1,2,4];
 
-        let result = bit_chunk_iterator::<u8>(input, 0).collect::<Vec<u64>>();
+        let bitchunks = bit_chunk_iterator::<u8>(input, 0);
+        let result = bitchunks.into_iter().collect::<Vec<u64>>();
 
         assert_eq!(vec![0,1,2,4], result);
     }
@@ -280,12 +265,12 @@ mod tests {
     fn test_iter_unaligned_8() {
         let input: &[u8] = &[0b0000000,0b00010001,0b00100010,0b01000100];
 
-        let bititer = bit_chunk_iterator::<u8>(input, 1);
+        let bitchunks = bit_chunk_iterator::<u8>(input, 1);
 
-        assert_eq!(7, bititer.remainder_len());
-        assert_eq!(0b00100010, bititer.remainder_bits());
+        assert_eq!(7, bitchunks.remainder_len());
+        assert_eq!(0b00100010, bitchunks.remainder_bits());
 
-        let result = bititer.collect::<Vec<u64>>();
+        let result = bitchunks.into_iter().collect::<Vec<u64>>();
 
         assert_eq!(vec![0b10000000, 0b00001000, 0b00010001], result);
     }
@@ -294,21 +279,21 @@ mod tests {
     fn test_iter_unaligned_16() {
         let input: &[u8] = &[0b01010101,0b11111111,0b01010101,0b11111111];
 
-        let bititer = bit_chunk_iterator::<u16>(input, 1);
+        let bitchunks = bit_chunk_iterator::<u16>(input, 1);
 
-        assert_eq!(15, bititer.remainder_len());
-        assert_eq!(0b0111111110101010, bititer.remainder_bits());
-
-        let result = bititer.collect::<Vec<u64>>();
+        let result = bitchunks.iter().collect::<Vec<u64>>();
 
         assert_eq!(vec![0b1111111110101010], result);
+
+        assert_eq!(15, bitchunks.remainder_len());
+        assert_eq!(0b0111111110101010, bitchunks.remainder_bits());
     }
 
     #[test]
     fn test_iter_aligned_16() {
         let input: &[u8] = &[0,1,2,4];
 
-        let result = bit_chunk_iterator::<u16>(input, 0).collect::<Vec<u64>>();
+        let result = bit_chunk_iterator::<u16>(input, 0).into_iter().collect::<Vec<u64>>();
 
         assert_eq!(vec![0x0100,0x0402], result);
     }
@@ -331,16 +316,15 @@ mod tests {
 
     #[test]
     fn test_aggregate_sum_kernel() {
-        let len = 1024;
+        let len = 1000;
         let input: Vec<f32> = (0..len).map(|i| if i % 2 == 0  {2.0} else {1.0}).collect();
-        let valid : Vec<u8> = (0..ceil_power_of_2(len, 8)/8).map(|i| 0b01010101).collect();
+        let valid : Vec<u8> = (0..ceil_div_power_of_2(len, 8)).map(|i| 0b01010101).collect();
 
         let expected: f32 = (0..len).map(|i| if i % 2 == 0  {2.0} else {0.0}).sum();
 
         let result = aggregate_sum_kernel(&input, &valid, 0);
 
         assert_eq!(expected, result);
-
     }
 
 }
