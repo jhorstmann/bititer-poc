@@ -67,7 +67,7 @@ fn floor_power_of_2(n: usize, p: usize) -> usize {
 
 pub fn bit_chunk_iterator<T: BitChunkAccessor>(buffer: &[u8], bit_offset: usize) -> BitChunkIterator<'_, T> {
     let bytes = T::bytes();
-    let bits = bytes * 8;
+    let bits = T::bits();
     debug_assert!(bits.is_power_of_two() && bits >= 8 && bits <= 64);
 
     let byte_offset = (bit_offset / 8);
@@ -75,10 +75,13 @@ pub fn bit_chunk_iterator<T: BitChunkAccessor>(buffer: &[u8], bit_offset: usize)
 
     let raw_data = unsafe { buffer.as_ptr().offset(byte_offset as isize) };
 
-    let len = buffer.len() - byte_offset;
-    let chunk_len = (len - bit_offset) / bytes;
+    let len_bits = (buffer.len()-byte_offset)*8 - bit_offset ;
+    let chunk_len = (len_bits) / bits;
 
-    let remainder_len = (len & (bits/8-1));
+    dbg!(buffer.len());
+    dbg!(len_bits);
+
+    let remainder_len = (len_bits & (bits-1));
 
     BitChunkIterator::<T> {
         buffer,
@@ -97,7 +100,21 @@ impl <T: BitChunkAccessor> BitChunkIterator<'_, T> {
     }
 
     fn remainder_bits(&self) -> u64 {
-        unimplemented!()
+        if self.remainder_len == 0 {
+            0
+        } else {
+            let mut res = 0_u64;
+            for i in 0..ceil_power_of_2(self.remainder_len as u64, 8) as usize / 8 {
+                res |= (self.buffer[self.chunk_len * T::bytes() + i] as u64) << (i*8);
+            }
+
+            let offset = self.bit_offset as u64;
+            if (offset != 0) {
+                (res >> offset) & !(1 << (64 - offset) - 1)
+            } else {
+                res
+            }
+        }
     }
 }
 
@@ -227,9 +244,28 @@ mod tests {
     fn test_iter_unaligned_8() {
         let input: &[u8] = &[0b0000000,0b00010001,0b00100010,0b01000100];
 
-        let result = bit_chunk_iterator::<u8>(input, 1).collect::<Vec<u64>>();
+        let bititer = bit_chunk_iterator::<u8>(input, 1);
+
+        assert_eq!(7, bititer.remainder_len());
+        assert_eq!(0b00100010, bititer.remainder_bits());
+
+        let result = bititer.collect::<Vec<u64>>();
 
         assert_eq!(vec![0b10000000, 0b00001000, 0b00010001], result);
+    }
+
+    #[test]
+    fn test_iter_unaligned_16() {
+        let input: &[u8] = &[0b01010101,0b11111111,0b01010101,0b11111111];
+
+        let bititer = bit_chunk_iterator::<u16>(input, 1);
+
+        assert_eq!(15, bititer.remainder_len());
+        assert_eq!(0b0111111110101010, bititer.remainder_bits());
+
+        let result = bititer.collect::<Vec<u64>>();
+
+        assert_eq!(vec![0b1111111110101010], result);
     }
 
     #[test]
