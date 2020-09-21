@@ -145,6 +145,42 @@ impl <T: BitChunkAccessor> Iterator for BitChunkIterator<'_, T> {
     }
 }
 
+pub fn aggregate_sum_kernel(input: &[f32], valid: &[u8], offset: usize) -> f32 {
+    let chunks = input[offset..].chunks_exact(64);
+    let remainder = chunks.remainder();
+
+    let sum = &mut [0_f32; 64];
+
+    let bititer = bit_chunk_iterator::<u64>(valid, offset);
+
+    let remainder_len = bititer.remainder_len();
+    let remainder_bits = bititer.remainder_bits();
+
+    bititer
+        .zip(chunks.into_iter())
+        .for_each(|(mask, slice)| {
+            for i in 0..64 {
+                let blend = if (mask & (1<<i)) != 0 {
+                    1.0
+                } else {
+                    0.0
+                };
+                sum[i] += blend * (slice[i]);
+            }
+        });
+
+    let mut sum: f32 = sum.iter().sum();
+
+    for i in 0..remainder_len {
+        if remainder_bits & (1<<i) != 0 {
+            sum += remainder[i];
+        }
+    }
+
+    sum
+}
+
+
 pub fn mul_kernel(left: &[f32], right: &[f32], valid: &[u8], offset: usize, output: &mut[f32]) {
     let mask_size = <u64 as BitChunkAccessor>::bits();
     let output_chunks = output.chunks_exact_mut(mask_size);
@@ -211,7 +247,7 @@ pub fn combine_bitmap(left: &[u8], left_offset: usize, right: &[u8], right_offse
 
 #[cfg(test)]
 mod tests {
-    use crate::{bit_chunk_iterator, ceil_power_of_2, floor_power_of_2, mul_kernel};
+    use crate::{bit_chunk_iterator, ceil_power_of_2, floor_power_of_2, mul_kernel, aggregate_sum_kernel};
 
     #[test]
     fn test_ceil() {
@@ -290,6 +326,20 @@ mod tests {
         mul_kernel(&left, &right, &valid, 0, &mut out);
 
         assert_eq!(expected, out);
+
+    }
+
+    #[test]
+    fn test_aggregate_sum_kernel() {
+        let len = 1024;
+        let input: Vec<f32> = (0..len).map(|i| if i % 2 == 0  {2.0} else {1.0}).collect();
+        let valid : Vec<u8> = (0..ceil_power_of_2(len, 8)/8).map(|i| 0b01010101).collect();
+
+        let expected: f32 = (0..len).map(|i| if i % 2 == 0  {2.0} else {0.0}).sum();
+
+        let result = aggregate_sum_kernel(&input, &valid, 0);
+
+        assert_eq!(expected, result);
 
     }
 
